@@ -1,12 +1,18 @@
+"""Direct future-frame delta ESN (v5: PCA targets + class-conditional memory + interaction context).
 
-
+Observes first K frames. Escena global (RGB) + contexto de interaccion derivado de
+`interaction_mask`: [centroid_x, centroid_y, area] por frame, SOLO de frames observados.
+El contexto entra al reservoir (frames 1..K-1) y al readout (frame K-1).
+Sin coordenadas privilegiadas del simulador.
+"""
 from pathlib import Path
 import numpy as np
 import cupy as cp
 import parameters as p
 
-ARCHITECTURE = 'maniskill_multimodal_direct_pca_classcond_v3'
+ARCHITECTURE = 'maniskill_multimodal_direct_pca_classcond_interaction_v5'
 HEAD_ARRAYS = ('X', 'fmean', 'fscale', 'rgb_alpha', 'rgb_mean')
+CONTEXT_DIM = 3
 
 
 # ----------------------------------------------------------------------------
@@ -19,13 +25,22 @@ def configuration():
     return mode, bool(p.USE_GOAL)
 
 
+def _use_interaction():
+    return bool(getattr(p, 'USE_INTERACTION_CONTEXT', True))
+
+
 def input_width():
     mode, goal = configuration()
-    return p.IMAGE_DIM + (p.JOINT_DIM if mode == 'multimodal' else 0) + (p.GOAL_DIM if goal else 0)
+    return (
+        p.IMAGE_DIM
+        + (p.JOINT_DIM if mode == 'multimodal' else 0)
+        + (CONTEXT_DIM if _use_interaction() else 0)
+        + (p.GOAL_DIM if goal else 0)
+    )
 
 
 def _block_weights():
-    default = {'state': 1.0, 'small': 1.0, 'q': 2.0, 'goal': 2.0}
+    default = {'state': 1.0, 'small': 1.0, 'q': 2.0, 'interaction': 2.0, 'goal': 2.0}
     default.update(getattr(p, 'BLOCK_WEIGHTS', {}))
     return default
 
@@ -38,6 +53,128 @@ def _class_conditional():
     return bool(getattr(p, 'CLASS_CONDITIONAL', True))
 
 
+# ----------------------------------------------------------------------------
+# Contexto de interaccion (desde la mascara)
+# ----------------------------------------------------------------------------
+def _interaction_context(row):
+    """(T,3): [centroid_x, centroid_y, area_fraction] desde máscara nativa."""
+
+    key = getattr(
+        p,
+        "INTERACTION_MASK_KEY",
+        "interaction_mask"
+    )
+
+    if key not in row:
+        raise KeyError(
+            f"{row.get('id', '?')}: no tiene '{key}'"
+        )
+
+    m = np.asarray(
+        row[key],
+        np.float32
+    )
+
+    if m.ndim == 4 and m.shape[-1] == 1:
+        m = m[..., 0]
+
+    if m.ndim != 3:
+        raise ValueError(
+            f"{row.get('id', '?')}: "
+            f"{key} debe ser (T,H,W), got {m.shape}"
+        )
+
+    T = len(row["image"])
+
+    if len(m) != T:
+        raise ValueError(
+            f"{row.get('id', '?')}: "
+            f"mask/image mismatch {len(m)} vs {T}"
+        )
+
+    # Usamos la resolución NATIVA de la máscara.
+    h, w = m.shape[1:]
+
+    m = np.clip(
+        m,
+        0.0,
+        1.0
+    )
+
+    area_px = m.sum(
+        axis=(1, 2)
+    )
+
+    xs = np.linspace(
+        -1.0,
+        1.0,
+        w,
+        dtype=np.float32
+    )[None, None, :]
+
+    ys = np.linspace(
+        -1.0,
+        1.0,
+        h,
+        dtype=np.float32
+    )[None, :, None]
+
+    denom = np.maximum(
+        area_px,
+        1e-6
+    )
+
+    cx = (
+        (m * xs).sum(axis=(1, 2))
+        / denom
+    )
+
+    cy = (
+        (m * ys).sum(axis=(1, 2))
+        / denom
+    )
+
+    # Si temporalmente no se ve el objeto,
+    # conservar el último centroide válido.
+    last_cx = 0.0
+    last_cy = 0.0
+
+    for t in range(T):
+        if area_px[t] < 1e-6:
+            cx[t] = last_cx
+            cy[t] = last_cy
+        else:
+            last_cx = float(cx[t])
+            last_cy = float(cy[t])
+
+    area_fraction = (
+        area_px
+        / float(h * w)
+    )
+
+    ctx = np.stack(
+        [
+            cx,
+            cy,
+            area_fraction
+        ],
+        axis=1
+    ).astype(np.float32)
+
+    if not np.isfinite(ctx).all():
+        raise ValueError(
+            f"{row.get('id', '?')}: "
+            "interaction context no finito"
+        )
+
+    return ctx
+
+def _norm_context(row, model, k):
+    """(k,3) cupy: contexto de los primeros k frames, estandarizado con stats del train."""
+    ctx = cp.asarray(_interaction_context(row)[:k], cp.float32)
+    return (ctx - cp.asarray(model['stats']['imean'])) / cp.asarray(model['stats']['istd'])
+
+
 def _validate(row):
     image = np.asarray(row['image'])
     if image.ndim != 2 or image.shape[1] != p.IMAGE_DIM:
@@ -46,6 +183,8 @@ def _validate(row):
         raise ValueError(f"{row['id']}: image/joint frame mismatch")
     if np.asarray(row['goal']).shape != (3,):
         raise ValueError(f"{row['id']}: expected goal XYZ shape (3,)")
+    if _use_interaction():
+        _interaction_context(row)
     return image
 
 
@@ -62,6 +201,7 @@ def new_model(N, seed, stats):
     W *= cp.float32(p.SPECTRAL_RADIUS / max(radius, 1e-12))
     return dict(Win=Win, W=W, bias=bias, N=N, seed=int(seed),
                 mode=p.EXPERIMENT_MODE, use_goal=bool(p.USE_GOAL),
+                use_interaction=_use_interaction(),
                 image_dim=p.IMAGE_DIM, stats=stats, heads={}, accuracy={}, bases={})
 
 
@@ -75,6 +215,9 @@ def prepare_observation(row, model, k):
         std = cp.asarray(model['stats']['qstd'])
         q = (raw_q - mean) / std
         modalities.append(cp.float32(p.JOINT_INPUT_SCALE) * (q[1:] - q[:-1]))
+    if model['use_interaction']:
+        scale = cp.float32(getattr(p, 'INTERACTION_INPUT_SCALE', 0.5))
+        modalities.append(scale * _norm_context(row, model, k)[1:])
     if model['use_goal']:
         goal = (cp.asarray(row['goal'], cp.float32) - cp.asarray(model['stats']['gmean'])) / cp.asarray(model['stats']['gstd'])
         modalities.append(cp.broadcast_to(cp.float32(p.GOAL_INPUT_SCALE) * goal, (k - 1, 3)))
@@ -87,13 +230,15 @@ def block_sizes(model):
              ('small', p.APPEARANCE_HEIGHT * p.APPEARANCE_WIDTH * p.IMAGE_CHANNELS)]
     if model['mode'] == 'multimodal':
         sizes.append(('q', int(p.JOINT_DIM)))
+    if model['use_interaction']:
+        sizes.append(('interaction', CONTEXT_DIM))
     if model['use_goal']:
         sizes.append(('goal', 3))
     return sizes
 
 
 def raw_feature(row, model, k):
-    """Feature SIN centrar ni escalar: [state, small, (q), (goal)]."""
+    """Feature SIN centrar ni escalar: [state, small, (q), (interaction), (goal)]."""
     obs = prepare_observation(row, model, k)
     state = cp.zeros((model['N'],), dtype=cp.float32)
     for t in range(len(obs)):
@@ -108,6 +253,8 @@ def raw_feature(row, model, k):
     if model['mode'] == 'multimodal':
         q = (cp.asarray(row['joints'][k - 1], cp.float32) - cp.asarray(model['stats']['qmean'])) / cp.asarray(model['stats']['qstd'])
         parts.append(q)
+    if model['use_interaction']:
+        parts.append(_norm_context(row, model, k)[k - 1])
     if model['use_goal']:
         goal = (cp.asarray(row['goal'], cp.float32) - cp.asarray(model['stats']['gmean'])) / cp.asarray(model['stats']['gstd'])
         parts.append(goal)
@@ -229,7 +376,8 @@ def _fit_head(rows, raw, model, k, basis, max_len, with_cls=False):
     head = dict(X=X.astype(cp.float32), fmean=fmean.astype(cp.float32), fscale=fscale.astype(cp.float32),
                 rgb_alpha=rgb_alpha.astype(cp.float32), rgb_mean=rgb_mean.astype(cp.float32),
                 basis=basis, q_values=np.arange(k, max_len, dtype=np.int32), Q=int(Q), class_heads={})
-    info = dict(n=n, lam_rgb=lam_rgb, rmse_rgb=float(cp.sqrt(cp.mean(res_rgb ** 2))))
+    info = dict(n=n, lam_rgb=lam_rgb, rmse_rgb=float(cp.sqrt(cp.mean(res_rgb ** 2))),
+                base_rgb=float(cp.sqrt(cp.mean((Y - Y.mean(axis=0)) ** 2))))
 
     if multimodal:
         Yj = cp.stack(jnt_t)
@@ -237,7 +385,8 @@ def _fit_head(rows, raw, model, k, basis, max_len, with_cls=False):
         jnt_mean = B * jnt_alpha.sum(axis=0)
         head['jnt_alpha'] = jnt_alpha.astype(cp.float32)
         head['jnt_mean'] = jnt_mean.astype(cp.float32)
-        info.update(lam_jnt=lam_j, rmse_jnt=float(cp.sqrt(cp.mean(res_j ** 2))))
+        info.update(lam_jnt=lam_j, rmse_jnt=float(cp.sqrt(cp.mean(res_j ** 2))),
+                    base_jnt=float(cp.sqrt(cp.mean((Yj - Yj.mean(axis=0)) ** 2))))
 
     if with_cls:
         labels = cp.asarray(np.array([int(row['label']) for row in rows], np.float64)[:, None])
@@ -251,9 +400,9 @@ def _fit_head(rows, raw, model, k, basis, max_len, with_cls=False):
 
 
 def _fmt(info):
-    out = f"n={info['n']}; LOO RMSE rgb-coef={info['rmse_rgb']:.4f}"
+    out = f"n={info['n']}; rgb-coef LOO={info['rmse_rgb']:.3f} (media={info['base_rgb']:.3f})"
     if 'rmse_jnt' in info:
-        out += f"; LOO RMSE joints={info['rmse_jnt']:.4f}"
+        out += f"; joints LOO={info['rmse_jnt']:.3f} (media={info['base_jnt']:.3f})"
     return out
 
 
@@ -264,10 +413,17 @@ def build_model(train, N, training_epsilon=0, augmentation_count=0, seed=42):
     if training_epsilon != 0 or augmentation_count:
         raise NotImplementedError('This first multimodal version deliberately disables augmentation/noise.')
     from data_utils import compute_train_stats
-    stats = compute_train_stats(train)
-    model = new_model(int(N), int(seed), stats)
     for row in train:
         _validate(row)
+    stats = compute_train_stats(train)
+
+    # Normalizacion del contexto: SOLO train.
+    if _use_interaction():
+        ctx = np.concatenate([_interaction_context(row) for row in train], axis=0)
+        stats['imean'] = ctx.mean(axis=0).astype(np.float32)
+        stats['istd'] = np.maximum(ctx.std(axis=0), 1e-6).astype(np.float32)
+
+    model = new_model(int(N), int(seed), stats)
 
     rank = int(getattr(p, 'IMAGE_PCA_RANK', 48))
     model['bases']['all'] = _image_basis(train, rank, seed)
@@ -280,7 +436,8 @@ def build_model(train, N, training_epsilon=0, augmentation_count=0, seed=42):
             rows_c = [row for row in train if int(row['label']) == c]
             if len(rows_c) >= min_rows:
                 model['bases'][c] = _image_basis(rows_c, rank, seed)
-    print(f"PCA de imagen: {model['basis'].shape[1]} componentes; clases={classes}; condicionado={cond}")
+    print(f"PCA de imagen: {model['basis'].shape[1]} componentes; clases={classes}; "
+          f"condicionado={cond}; interaccion={model['use_interaction']}")
 
     for k in p.READOUT_K:
         rows = [row for row in train if len(row['image']) > k]
@@ -390,6 +547,7 @@ def save_model(path, model):
             _save_head(payload, f'{k}_c{c}', sub, multimodal)
     np.savez_compressed(path, **payload, N=model['N'], seed=model['seed'],
                         mode=model['mode'], use_goal=int(model['use_goal']),
+                        use_interaction=int(model['use_interaction']),
                         image_dim=model['image_dim'],
                         ks=np.asarray(sorted(model['heads']), np.int32),
                         architecture=ARCHITECTURE)
@@ -401,17 +559,27 @@ def load_model(path):
             raise ValueError(f"Modelo con arquitectura {d['architecture']}; se espera {ARCHITECTURE}. Reentrena.")
         mode = str(d['mode'])
         use_goal = bool(int(d['use_goal']))
-        if mode != p.EXPERIMENT_MODE or use_goal != p.USE_GOAL or int(d['image_dim']) != p.IMAGE_DIM:
-            raise ValueError('Model/config mode, goal, or image dimension mismatch')
+        use_interaction = bool(int(d['use_interaction']))
+        if (
+            mode != p.EXPERIMENT_MODE
+            or use_goal != p.USE_GOAL
+            or use_interaction != _use_interaction()
+            or int(d['image_dim']) != p.IMAGE_DIM
+        ):
+            raise ValueError('Model/config mode, goal, interaction-context, or image dimension mismatch')
         multimodal = mode == 'multimodal'
-        stats = {name: np.asarray(d[f'stats_{name}'], np.float32) for name in ('qmean', 'qstd', 'gmean', 'gstd')}
+        stat_names = ['qmean', 'qstd', 'gmean', 'gstd']
+        if use_interaction:
+            stat_names += ['imean', 'istd']
+        stats = {name: np.asarray(d[f'stats_{name}'], np.float32) for name in stat_names}
         model = {name: cp.asarray(d[name], cp.float32) for name in ('Win', 'W', 'bias')}
         bases = {}
         for key in d.files:
             if key.startswith('basis_'):
                 tag = key[len('basis_'):]
                 bases['all' if tag == 'all' else int(tag)] = cp.asarray(d[key], cp.float32)
-        model.update(N=int(d['N']), seed=int(d['seed']), mode=mode, use_goal=use_goal,
+        model.update(N=int(d['N']), seed=int(d['seed']), mode=mode,
+                     use_goal=use_goal, use_interaction=use_interaction,
                      image_dim=int(d['image_dim']), stats=stats, heads={}, accuracy={},
                      bases=bases, basis=bases['all'])
         for k in d['ks']:

@@ -1,4 +1,4 @@
-"""Parameters for ManiSkill multimodal direct PCA ESN v3 (class-conditional)."""
+"""Parameters for ManiSkill multimodal direct PCA ESN v5 (class + interaction context)."""
 from pathlib import Path
 import numpy as np
 
@@ -6,33 +6,37 @@ ROOT = Path(__file__).resolve().parent
 DATA_PATH = ROOT / "datasets" / "maniskill_multimodal" / "multimodal_object_context.h5"
 RESULTS_DIR = ROOT / "Results_esn_multitask"
 
-# Modo
+# Mode
 EXPERIMENT_MODE = "multimodal"   # "vision" or "multimodal"
 USE_GOAL = False
 
-# Imagen
+# Interaction context from the mask: [centroid_x, centroid_y, area] per observed frame
+USE_INTERACTION_CONTEXT = True
+INTERACTION_MASK_KEY = "interaction_mask"
+INTERACTION_INPUT_SCALE = 0.50
+
+# Image
 IMAGE_HEIGHT = 64
 IMAGE_WIDTH = 64
-IMAGE_MODE = "rgb"               # "rgb" or "grayscale"
+IMAGE_MODE = "rgb"
 IMAGE_CHANNELS = 3 if IMAGE_MODE == "rgb" else 1
 IMAGE_DIM = IMAGE_HEIGHT * IMAGE_WIDTH * IMAGE_CHANNELS
 
-# Ultimo frame observado usado como feature (dims deben dividir a las de la imagen)
-APPEARANCE_HEIGHT = 32
-APPEARANCE_WIDTH = 32
+APPEARANCE_HEIGHT = 64
+APPEARANCE_WIDTH = 64
 APPEARANCE_DIM = APPEARANCE_HEIGHT * APPEARANCE_WIDTH * IMAGE_CHANNELS
 
-# PCA de los deltas RGB futuros
+# Future RGB PCA
 IMAGE_PCA_RANK = 48
 IMAGE_BASIS_SAMPLES = 4000
 
-# Propiocepcion / goal
+# Proprioception / goal
 JOINT_DIM = 9
 GOAL_DIM = 3
 JOINT_INPUT_SCALE = 0.25
 GOAL_INPUT_SCALE = 0.25
 
-# Puntos de prediccion
+# Forecast points
 READOUT_K = (5, 15, 20)
 TEST_K = READOUT_K
 
@@ -45,18 +49,24 @@ LEAK_RATE = 0.25
 INPUT_SCALE = 0.20
 
 # Readout
-BLOCK_WEIGHTS = {"state": 1.0, "small": 1.0, "q": 2.0, "goal": 2.0}
-RIDGE_GRID = np.logspace(-10, 1, 12)   # relativo a la traza media del Gram
+BLOCK_WEIGHTS = {
+    "state": 1.0,
+    "small": 1.0,
+    "q": 2.0,
+    "interaction": 2.0,
+    "goal": 2.0,
+}
+RIDGE_GRID = np.logspace(-10, 1, 12)
 
-# Memoria condicionada por clase (Pick/Push)
+# Pick/Push class conditioning
 CLASS_CONDITIONAL = True
 MIN_CLASS_ROWS = 8
 
-# Reconstruccion
+# Reconstruction
 DELTA_CLIP = 1.0
 SMOOTH_WINDOW = 3
 
-# Entrenamiento
+# Training
 TRAINING_EPSILONS = (0.0,)
 AUGMENTATION_COPIES = 0
 AUGMENT_FLIP = False
@@ -72,7 +82,8 @@ def experiment_tag():
     return (
         f"{EXPERIMENT_MODE}_{IMAGE_MODE}_{IMAGE_HEIGHT}x{IMAGE_WIDTH}_"
         f"goal{int(USE_GOAL)}_pca{IMAGE_PCA_RANK}_"
-        f"{'cc' if CLASS_CONDITIONAL else 'nocc'}_v3"
+        f"{'cc' if CLASS_CONDITIONAL else 'nocc'}_"
+        f"ictx{int(USE_INTERACTION_CONTEXT)}_v5"
     )
 
 
