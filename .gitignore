@@ -1,0 +1,42 @@
+cat > .gitignore <<'EOF'
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Environments
+venv/
+.venv/
+env/
+
+# Datasets
+datasets/
+*.h5
+*.hdf5
+
+# Trained models
+*.npz
+*.pth
+*.pt
+*.ckpt
+
+# Results
+Results_esn_multitask/
+results/
+outputs/
+sim_rollouts/
+datasets/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+
+# Temporary
+*.log
+*.tmp
+EOF
+
