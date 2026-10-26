@@ -5,7 +5,7 @@ import numpy as np
 import cupy as cp
 import parameters as p
 from data_utils import load_split
-from esn_test import build_model, save_model
+from esn import build_model, save_model
 
 def main():
     ap=argparse.ArgumentParser()

@@ -9,7 +9,7 @@ import cupy as cp
 import parameters as p
 import metrics
 from data_utils import load_split
-from esn_test import load_model, predict_trajectory
+from esn import load_model, predict_trajectory
 
 
 def main():
