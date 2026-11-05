@@ -1,28 +1,67 @@
-"""Training entry point for vision / multimodal ESN, optional goal conditioning."""
-import argparse
-from pathlib import Path
+"""Train the ESN."""
+
+import argparse, sys
 import numpy as np
 import cupy as cp
-import parameters as p
-from data_utils import load_split
-from esn import build_model, save_model
+from model_loader import load_model_package
+
 
 def main():
     ap=argparse.ArgumentParser()
-    ap.add_argument('--neurons',type=int,nargs='+',default=p.NEURON_COUNTS)
-    ap.add_argument('--runs',type=int,default=p.RUNS)
-    args=ap.parse_args()
-    train=load_split('train', data_path=p.DATA_PATH)
-    print(f'Experiment={p.experiment_tag()}, training sequences={len(train)}, frame range={min(r["length"] for r in train)}..{max(r["length"] for r in train)}')
-    seeds=np.random.SeedSequence(p.RANDOM_SEED).spawn(args.runs)
-    for neurons in args.neurons:
+    ap.add_argument("--model",default="baseline")
+    ap.add_argument("--neurons",type=int,nargs="+")
+    ap.add_argument("--runs",type=int)
+    a=ap.parse_args()
+
+    p,esn=load_model_package(a.model)
+    sys.modules["parameters"],sys.modules["esn"]=p,esn
+    from data_utils import load_split
+
+    neurons=a.neurons or p.NEURON_COUNTS
+    runs=a.runs or p.RUNS
+
+    splits=getattr(p,"TRAIN_SPLITS",("train",))
+
+    train=[]
+    for split in splits:
+        rows=load_split(split,data_path=p.DATA_PATH)
+        print(f"{split.upper()}={len(rows)}")
+        train.extend(rows)
+
+    print(
+        f"\nMODEL={a.model}"
+        f"\nARCH={esn.ARCHITECTURE}"
+        f"\nDATA={p.DATA_PATH}"
+        f"\nRESULTS={p.RESULTS_DIR}"
+        f"\nTRAIN_SPLITS={splits}"
+    )
+
+    print(
+        f"TOTAL TRAIN={len(train)} | "
+        f"frames={min(x['length'] for x in train)}.."
+        f"{max(x['length'] for x in train)}\n"
+    )
+
+    seeds=np.random.SeedSequence(p.RANDOM_SEED).spawn(runs)
+
+    for n in neurons:
         for run,seq in enumerate(seeds,1):
             seed=int(seq.generate_state(1,dtype=np.uint32)[0])
-            model=build_model(train,neurons,seed=seed)
-            target=p.MODEL_DIR / f'N_{neurons}' / f'run_{run:02d}' / 'model.npz'
-            save_model(target,model)
-            print('Saved:',target)
+
+            model=esn.build_model(
+                train,
+                n,
+                seed=seed,
+            )
+
+            path=p.MODEL_DIR/f"N_{n}"/f"run_{run:02d}"/"model.npz"
+            esn.save_model(path,model)
+
+            print("Saved:",path)
+
             del model
             cp.get_default_memory_pool().free_all_blocks()
 
-if __name__=='__main__': main()
+
+if __name__=="__main__":
+    main()
